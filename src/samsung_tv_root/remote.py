@@ -434,7 +434,13 @@ class RemoteInputCoordinator:
         server = RemoteInputServer(callback_host, expected_peers, secret)
         await server.start()
         remote_directory = REMOTE_DIRECTORIES[self.television.model]
-        remote_token = remote_directory / f"rt-{secrets.token_hex(8)}"
+        # The archive route restricts WRITEFILE to the agent's per-session
+        # staging directory; tokens must go there instead of the shared
+        # model directory.
+        token_directory = (
+            root_connection.writable_directory or remote_directory
+        )
+        remote_token = token_directory / f"rt-{secrets.token_hex(8)}"
         device_digest = hashlib.sha256(device.name.encode()).hexdigest()[:12]
         remote_log = remote_directory / f"remote-{device_digest}.log"
         try:

@@ -427,6 +427,10 @@ async def acquire(
                     f"uid={identity.uid} euid={identity.euid} "
                     f"gid={identity.gid} egid={identity.egid}"
                 )
+            # The archive root agent only accepts WRITEFILE requests inside its
+            # per-session staging directory; expose it so feature launchers
+            # (remote input, events) write tokens where the agent allows.
+            connection.writable_directory = STAGING_ROOT / package
             # The launcher capture stays open until the root agent exits;
             # wait for it in ArchiveRootLease.close() after shutdown.
             return ArchiveRootLease(

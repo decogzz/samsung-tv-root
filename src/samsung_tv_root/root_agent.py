@@ -10,7 +10,7 @@ import secrets
 import socket
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 PROTOCOL_VERSION = "SAMSUNG-TV-ROOT/1"
@@ -170,6 +170,13 @@ class RootAgentConnection:
         self._sequence = 0
         self._closed = False
         self._request_lock = asyncio.Lock()
+        # Directory on the TV that the remote root agent accepts WRITEFILE
+        # requests for. Backends whose agent restricts writes to a per-session
+        # staging directory (the archive route) populate this so feature
+        # launchers know where tokens may be written. None means the agent
+        # has no per-connection restriction and callers fall back to the
+        # model's default remote directory.
+        self.writable_directory: PurePosixPath | None = None
 
     async def ping(self, timeout: float = DEFAULT_COMMAND_TIMEOUT) -> RootAgentIdentity:
         async with self._request_lock:

@@ -315,7 +315,13 @@ class NativeEventCoordinator:
         )
         await server.start()
         remote_directory = REMOTE_DIRECTORIES[self.television.model]
-        remote_token = remote_directory / f"et-{secrets.token_hex(8)}"
+        # The archive route restricts WRITEFILE to the agent's per-session
+        # staging directory; tokens must go there instead of the shared
+        # model directory.
+        token_directory = (
+            root_connection.writable_directory or remote_directory
+        )
+        remote_token = token_directory / f"et-{secrets.token_hex(8)}"
         remote_log = remote_directory / f"el-{secrets.token_hex(8)}.log"
         try:
             await root_connection.write_file(

@@ -1,7 +1,17 @@
+import asyncio
 import base64
+from pathlib import PurePosixPath
+from types import SimpleNamespace
 
-from samsung_tv_root.config import RemoteRuleConfiguration
+from samsung_tv_root.config import (
+    RemoteConfiguration,
+    RemoteDeviceConfiguration,
+    RemoteRuleConfiguration,
+    TelevisionConfiguration,
+)
 from samsung_tv_root.remote import (
+    REMOTE_DIRECTORIES,
+    RemoteInputCoordinator,
     _blocked_tokens,
     _capability_request,
     _matches,
@@ -69,3 +79,123 @@ def test_input_device_inventory_keeps_kernel_device_strings() -> None:
     assert devices[0].node == "/dev/input/event4"
     assert devices[0].bus == "0005"
     assert devices[0].vendor == "04e8"
+
+
+class _FakeRootConnection:
+    def __init__(self, writable_directory: PurePosixPath | None) -> None:
+        self.writable_directory = writable_directory
+        self.written: list[str] = []
+        self.executed: list[str] = []
+
+    async def write_file(self, path, data: bytes, timeout: float = 5.0) -> None:
+        self.written.append(str(path))
+
+    async def execute(self, command: str, timeout: float = 5.0) -> object:
+        self.executed.append(command)
+        return SimpleNamespace(
+            stdout="", stderr="", exit_code=0, timed_out=False
+        )
+
+
+class _FakeRemoteInputServer:
+    def __init__(self, *args, **kwargs) -> None:
+        self.port = 41234
+        self.closed = False
+
+    async def start(self) -> None:
+        pass
+
+    async def wait(self, timeout: float) -> object:
+        return SimpleNamespace(
+            identity=SimpleNamespace(
+                process_id=123,
+                user_id=0,
+                group_id=0,
+                device="Smart Control",
+                node="/dev/input/event3",
+                transport="bluetooth",
+                model="VG",
+            )
+        )
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _archive_television() -> TelevisionConfiguration:
+    return TelevisionConfiguration(
+        name="s90d",
+        model="archive",
+        host="192.0.2.36",
+        device_id=None,
+        root_on_presence=True,
+        disable_native_execution_policy=False,
+        remote=RemoteConfiguration(
+            enabled=True,
+            devices=(
+                RemoteDeviceConfiguration(
+                    name="Smart Control", transport="bluetooth", model="VG"
+                ),
+            ),
+            rules=(),
+        ),
+    )
+
+
+def test_launch_writes_token_into_archive_staging_directory(monkeypatch) -> None:
+    """The archive root agent only accepts WRITEFILE inside its per-session
+    staging directory; the remote-input token must go there."""
+    import samsung_tv_root.remote as remote_module
+
+    monkeypatch.setattr(remote_module, "RemoteInputServer", _FakeRemoteInputServer)
+    coordinator = RemoteInputCoordinator(
+        _archive_television(), lambda *_: None, lambda *a, **k: {}, (30.0,)
+    )
+    staging = PurePosixPath("/home/owner/share/tmp/sdk_tools/archive-root-abcd")
+    root = _FakeRootConnection(staging)
+
+    async def run() -> None:
+        session = await coordinator._launch(
+            root,
+            "192.0.2.36",
+            coordinator.television.remote.devices[0],
+        )
+        await session.server.close()
+
+    asyncio.run(run())
+
+    assert len(root.written) == 1
+    written = root.written[0]
+    assert written.startswith(str(staging))
+    assert "/rt-" in written
+    # The launch command must reference the token path and the agent dll
+    # that lives in the model's shared remote directory.
+    assert str(REMOTE_DIRECTORIES["archive"]) in root.executed[0]
+    assert written in root.executed[0]
+
+
+def test_launch_falls_back_to_model_directory_without_restriction(monkeypatch) -> None:
+    """Connections without a writable_directory restriction (qn90b/qn90f)
+    keep writing tokens to the model's shared remote directory."""
+    import samsung_tv_root.remote as remote_module
+
+    monkeypatch.setattr(remote_module, "RemoteInputServer", _FakeRemoteInputServer)
+    coordinator = RemoteInputCoordinator(
+        _archive_television(), lambda *_: None, lambda *a, **k: {}, (30.0,)
+    )
+    root = _FakeRootConnection(None)
+
+    async def run() -> None:
+        session = await coordinator._launch(
+            root,
+            "192.0.2.36",
+            coordinator.television.remote.devices[0],
+        )
+        await session.server.close()
+
+    asyncio.run(run())
+
+    assert len(root.written) == 1
+    written = root.written[0]
+    assert written.startswith(str(REMOTE_DIRECTORIES["archive"]))
+    assert "/rt-" in written
