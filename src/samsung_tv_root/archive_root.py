@@ -427,13 +427,8 @@ async def acquire(
                     f"uid={identity.uid} euid={identity.euid} "
                     f"gid={identity.gid} egid={identity.egid}"
                 )
-            if launch_task is not None:
-                launch_result = await asyncio.wait_for(launch_task, timeout=15)
-                if "[exit:0]" not in launch_result.output:
-                    raise ArchiveRootError(
-                        "launcher exited unsuccessfully: "
-                        + launch_result.output.strip()
-                    )
+            # The launcher capture stays open until the root agent exits;
+            # wait for it in ArchiveRootLease.close() after shutdown.
             return ArchiveRootLease(
                 connection=connection,
                 server=server,

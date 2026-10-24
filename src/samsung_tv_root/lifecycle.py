@@ -195,6 +195,8 @@ class ArchiveRootBackend:
             host,
             callback_host=callback_host,
             bind_host=callback_host,
+            sdb_timeout=30.0,
+            accept_timeout=45.0,
         )
 
     def is_transient(self, error: BaseException) -> bool:
