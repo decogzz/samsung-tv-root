@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import re
+import shlex
 from enum import Enum
 from typing import Any
 
-from .config import TelevisionConfiguration
+from .config import APPLICATION_ID_PATTERN, TelevisionConfiguration
 from .capture import CaptureError, Qn90fCaptureControl
 from .display import (
     DisplayControlError,
@@ -76,7 +78,24 @@ MODEL_ACTION_CAPABILITIES = {
         "screenshot.hdmi_960x540",
         "overlay.graphics",
     ),
+    "archive": (
+        "app.launch",
+    ),
 }
+
+# The archive route runs the model-independent tarlauncher chain; these
+# shared capabilities need per-model adapters that it does not provide.
+ARCHIVE_IMPLEMENTED_CAPABILITIES = (
+    "root.acquire",
+    "execute",
+    "remote.devices",
+    "remote.observe",
+    "remote.filter",
+    "volume.status",
+    "volume.set",
+    "volume.events",
+    "app.launch",
+)
 
 SHARED_CAPABILITY_GAPS: dict[str, tuple[CapabilityState, str]] = {}
 
@@ -105,9 +124,59 @@ QN90B_CAPABILITY_GAPS = {
         CapabilityState.NOT_INVESTIGATED,
         "This project has not validated transparent text or graphics overlays on QN90B.",
     ),
+    "app.launch": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The app_launcher path is only validated on the archive route; "
+        "it has not been tested on QN90B.",
+    ),
 }
 
-QN90F_CAPABILITY_GAPS: dict[str, tuple[CapabilityState, str]] = {}
+QN90F_CAPABILITY_GAPS: dict[str, tuple[CapabilityState, str]] = {
+    "app.launch": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The app_launcher path is only validated on the archive route; "
+        "it has not been tested on QN90F.",
+    ),
+}
+
+ARCHIVE_CAPABILITY_GAPS: dict[str, tuple[CapabilityState, str]] = {
+    "uep.status": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The archive route does not include a UEP control path.",
+    ),
+    "uep.disable": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The archive route does not include a UEP control path.",
+    ),
+    "source.list": (
+        CapabilityState.NOT_INVESTIGATED,
+        "No Samsung source adapter has been validated for the archive route.",
+    ),
+    "source.current": (
+        CapabilityState.NOT_INVESTIGATED,
+        "No Samsung source adapter has been validated for the archive route.",
+    ),
+    "source.select": (
+        CapabilityState.NOT_INVESTIGATED,
+        "No Samsung source adapter has been validated for the archive route.",
+    ),
+    "local_dimming.status": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The local-dimming adapter has not been validated on the archive route.",
+    ),
+    "local_dimming.set": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The local-dimming adapter has not been validated on the archive route.",
+    ),
+    "local_dimming.toggle": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The local-dimming adapter has not been validated on the archive route.",
+    ),
+    "events.tv_state": (
+        CapabilityState.NOT_INVESTIGATED,
+        "The common event agent is not staged by the archive daemon backend.",
+    ),
+}
 
 
 class TelevisionCapabilities:
@@ -123,15 +192,29 @@ class TelevisionCapabilities:
             self.display = Qn90bDisplayControl()
             self.capture = None
             self.overlay = None
+        elif configuration.model == "archive":
+            self.source = None
+            self.display = None
+            self.capture = None
+            self.overlay = None
         else:
             raise CapabilityError(f"unsupported model: {configuration.model}")
         store = LocalDimmingModeStore(
             default_local_dimming_state_path(configuration.name)
         )
-        self.local_dimming = SamsungTvLocalDimmingControl(store)
+        self.local_dimming = (
+            None if configuration.model == "archive"
+            else SamsungTvLocalDimmingControl(store)
+        )
         self.volume = SamsungTvVolumeControl()
 
     def names(self) -> tuple[str, ...]:
+        if self.configuration.model == "archive":
+            return (
+                "volume.status",
+                "volume.set",
+                "app.launch",
+            )
         shared_actions = (
             "source.list",
             "source.current",
@@ -145,19 +228,23 @@ class TelevisionCapabilities:
         return shared_actions + MODEL_ACTION_CAPABILITIES[self.configuration.model]
 
     def inventory(self) -> list[dict[str, str]]:
-        implemented_names = (
-            SHARED_IMPLEMENTED_CAPABILITIES
-            + MODEL_ACTION_CAPABILITIES[self.configuration.model]
-        )
+        if self.configuration.model == "archive":
+            implemented_names = ARCHIVE_IMPLEMENTED_CAPABILITIES
+            model_gaps = ARCHIVE_CAPABILITY_GAPS
+        else:
+            implemented_names = (
+                SHARED_IMPLEMENTED_CAPABILITIES
+                + MODEL_ACTION_CAPABILITIES[self.configuration.model]
+            )
+            model_gaps = (
+                QN90B_CAPABILITY_GAPS
+                if self.configuration.model == "qn90b"
+                else QN90F_CAPABILITY_GAPS
+            )
         implemented = [
             {"name": name, "state": CapabilityState.IMPLEMENTED.value}
             for name in implemented_names
         ]
-        model_gaps = (
-            QN90B_CAPABILITY_GAPS
-            if self.configuration.model == "qn90b"
-            else QN90F_CAPABILITY_GAPS
-        )
         gaps = {**SHARED_CAPABILITY_GAPS, **model_gaps}
         return implemented + [
             {
@@ -194,13 +281,35 @@ class TelevisionCapabilities:
     ) -> dict[str, Any]:
         if action == "capabilities":
             return {"capabilities": self.inventory()}
+        if action == "app.launch":
+            self._require(action)
+            application = self._required_string(request.get("app"), "app")
+            if APPLICATION_ID_PATTERN.fullmatch(application) is None:
+                raise CapabilityError(
+                    "app must contain only letters, digits, dots, underscores, "
+                    "and hyphens"
+                )
+            launch = await connection.execute(
+                shlex.join(("/usr/bin/app_launcher", "-s", application)),
+                20.0,
+            )
+            if launch.timed_out or launch.exit_code != 0:
+                detail = launch.stderr.strip() or launch.stdout.strip()
+                raise CapabilityError(
+                    f"app launch failed with exit {launch.exit_code}"
+                    + (f": {detail}" if detail else "")
+                )
+            return {"app": application, "output": launch.stdout.strip()}
         if action == "source.list":
+            self._require_adapters(action, self.source)
             devices = await self.source.list_sources(connection)
             return {"sources": [device.to_dict() for device in devices]}
         if action == "source.current":
+            self._require_adapters(action, self.source)
             current = await self.source.current_source(connection)
             return {"source": current.to_dict()}
         if action == "source.select":
+            self._require_adapters(action, self.source)
             source = self._source(request)
             current = await self.source.current_source(connection)
             if current.source == source.value:
@@ -288,6 +397,7 @@ class TelevisionCapabilities:
         action: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_adapters(action, self.local_dimming)
         source = await self.source.current_source(connection)
         expected = request.get("expected_source")
         if expected is not None:
@@ -346,11 +456,12 @@ class TelevisionCapabilities:
 
     def _require(self, action: str) -> None:
         if action not in self.names():
-            model_gaps = (
-                QN90B_CAPABILITY_GAPS
-                if self.configuration.model == "qn90b"
-                else QN90F_CAPABILITY_GAPS
-            )
+            if self.configuration.model == "qn90b":
+                model_gaps = QN90B_CAPABILITY_GAPS
+            elif self.configuration.model == "archive":
+                model_gaps = ARCHIVE_CAPABILITY_GAPS
+            else:
+                model_gaps = QN90F_CAPABILITY_GAPS
             state, detail = {**SHARED_CAPABILITY_GAPS, **model_gaps}.get(
                 action,
                 (
@@ -359,6 +470,14 @@ class TelevisionCapabilities:
                 ),
             )
             raise CapabilityError(f"{action}: {state.value}: {detail}")
+
+    def _require_adapters(self, action: str, adapter: Any) -> None:
+        if adapter is None:
+            # The archive route has no model adapters; report it as a gap.
+            self._require(action)
+            raise CapabilityError(
+                f"{action}: the archive route provides no model adapter"
+            )
 
     @staticmethod
     def _source(request: dict[str, Any]) -> HdmiInput:

@@ -115,6 +115,50 @@ def test_unknown_television_field_is_rejected() -> None:
         parse_configuration(value)
 
 
+def test_archive_model_and_post_root_commands_are_parsed() -> None:
+    value = base_configuration()
+    value["televisions"]["living-room"]["model"] = "archive"
+    value["televisions"]["living-room"]["post_root_commands"] = [
+        "systemctl mask --runtime --now adagent-service.service"
+    ]
+    television = parse_configuration(value).television("living-room")
+    assert television.model == "archive"
+    assert television.post_root_commands == (
+        "systemctl mask --runtime --now adagent-service.service",
+    )
+
+
+def test_app_launch_remote_rule_requires_app() -> None:
+    value = base_configuration()
+    value["televisions"]["living-room"]["remote"] = {
+        "enabled": True,
+        "devices": [{"name": "Smart Control", "transport": "bluetooth", "model": "VG"}],
+        "rules": [{"key": "XF86Home", "action": "app.launch"}],
+    }
+    with pytest.raises(ConfigurationError, match="app is required"):
+        parse_configuration(value)
+
+
+def test_app_launch_remote_rule_is_parsed() -> None:
+    value = base_configuration()
+    value["televisions"]["living-room"]["model"] = "archive"
+    value["televisions"]["living-room"]["remote"] = {
+        "enabled": True,
+        "devices": [{"name": "Smart Control", "transport": "bluetooth", "model": "VG"}],
+        "rules": [
+            {
+                "device": "Smart Control",
+                "key": "XF86Home",
+                "action": "app.launch",
+                "app": "FreeMyTV.tizen",
+            }
+        ],
+    }
+    rule = parse_configuration(value).television("living-room").remote.rules[0]
+    assert rule.action == "app.launch"
+    assert rule.app == "FreeMyTV.tizen"
+
+
 def test_remote_rule_rejects_a_source_ignored_by_its_action() -> None:
     value = base_configuration()
     value["televisions"]["living-room"]["remote"] = {

@@ -11,6 +11,8 @@ PAYLOAD_FILES = {
         "SamsungTvArchiveRoot.runtimeconfig.json",
         "SamsungTvRootAgent.dll",
         "SamsungTvRootAgent.runtimeconfig.json",
+        "SamsungTvRemoteInputAgent.dll",
+        "SamsungTvRemoteInputAgent.runtimeconfig.json",
     ),
     "common31": (
         "SamsungTvArchiveRoot.dll",

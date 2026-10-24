@@ -40,6 +40,18 @@ def test_qn90f_inventory_reports_known_non_packaged_capabilities() -> None:
     assert all(state != "unavailable" for state in states.values())
 
 
+def test_archive_inventory_implements_root_remote_and_app_launch() -> None:
+    inventory = TelevisionCapabilities(television("archive")).inventory()
+    states = {item["name"]: item["state"] for item in inventory}
+    assert states["root.acquire"] == "implemented"
+    assert states["execute"] == "implemented"
+    assert states["remote.observe"] == "implemented"
+    assert states["remote.filter"] == "implemented"
+    assert states["app.launch"] == "implemented"
+    assert states["uep.disable"] == "not_investigated"
+    assert states["source.select"] == "not_investigated"
+
+
 def test_inventory_includes_daemon_and_remote_capabilities() -> None:
     inventory = TelevisionCapabilities(television("qn90f")).inventory()
     states = {item["name"]: item["state"] for item in inventory}

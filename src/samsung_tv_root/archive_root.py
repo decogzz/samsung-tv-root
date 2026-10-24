@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import ipaddress
 import json
@@ -17,7 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .resources import payload_directory
-from .root_agent import RootAgentServer, generate_secret, write_secret
+from .root_agent import (
+    RootAgentConnection,
+    RootAgentServer,
+    generate_secret,
+    write_secret,
+)
 from .sdb import CaptureResult, SdbClient, SdbError, find_sdb, route_callback_host
 
 
@@ -36,6 +42,19 @@ SYSTEM_HASH_COMMAND = "sha256sum /etc/passwd /usr/share/sdbd/public.pem"
 
 class ArchiveRootError(RuntimeError):
     pass
+
+
+class ArchiveRootTransientError(ArchiveRootError):
+    """Injection, callback, or TV-side congestion — safe for the daemon to retry."""
+
+
+REMOTE_AGENT_DIRECTORY = PurePosixPath(
+    "/home/owner/share/tmp/sdk_tools/samsung-tv-root/archive"
+)
+REMOTE_AGENT_FILES = (
+    "SamsungTvRemoteInputAgent.dll",
+    "SamsungTvRemoteInputAgent.runtimeconfig.json",
+)
 
 
 @dataclass(frozen=True)
@@ -257,6 +276,16 @@ def _stage(client: SdbClient, directory: Path, payloads: Path, package: str) -> 
         directory / f"{archive_name}.signature",
         ON_DEMAND / f"{archive_name}.signature",
     )
+    _stage_remote_agent(client, payloads)
+
+
+def _stage_remote_agent(client: SdbClient, payloads: Path) -> None:
+    sources = [payloads / name for name in REMOTE_AGENT_FILES]
+    if not all(source.is_file() for source in sources):
+        return
+    _capture(client, f"/bin/mkdir -p {REMOTE_AGENT_DIRECTORY}")
+    for source in sources:
+        client.push(source, REMOTE_AGENT_DIRECTORY / source.name)
 
 
 def _cleanup(client: SdbClient, package: str) -> bool:
@@ -272,19 +301,53 @@ def _cleanup(client: SdbClient, package: str) -> bool:
     return True
 
 
-async def probe(
+@dataclass
+class ArchiveRootLease:
+    connection: RootAgentConnection
+    server: RootAgentServer
+    client: SdbClient
+    package: str
+    assessment: TargetAssessment
+    launch_task: asyncio.Task[CaptureResult] | None
+    cleaned: bool = False
+    system_files_unchanged: bool | None = None
+
+    async def shutdown(self) -> None:
+        with contextlib.suppress(Exception):
+            await self.connection.shutdown()
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self.connection.close()
+        await self.server.close()
+        if self.launch_task is not None and not self.launch_task.done():
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.launch_task, timeout=5)
+        try:
+            self.cleaned = await asyncio.to_thread(_cleanup, self.client, self.package)
+        except (ArchiveRootError, SdbError):
+            self.cleaned = False
+        try:
+            final_hashes = await asyncio.to_thread(
+                _capture, self.client, SYSTEM_HASH_COMMAND
+            )
+            self.system_files_unchanged = (
+                final_hashes == self.assessment.original_hashes
+            )
+        except (ArchiveRootError, SdbError):
+            self.system_files_unchanged = False
+
+
+async def acquire(
     tv_host: str,
     *,
-    model: str | None = None,
     runtime: str | None = None,
     callback_host: str | None = None,
     bind_host: str | None = None,
     sdb_timeout: float = 15.0,
     accept_timeout: float = 30.0,
-    command_timeout: float = 45.0,
-    commands: tuple[str, ...] = (),
     payloads: Path | None = None,
-) -> dict[str, object]:
+) -> ArchiveRootLease:
     ipaddress.IPv4Address(tv_host)
     callback = callback_host or route_callback_host(tv_host)
     ipaddress.IPv4Address(callback)
@@ -350,41 +413,20 @@ async def probe(
                         launch_output = launch_task.result().output.strip()
                     except Exception as launch_error:
                         launch_output = str(launch_error)
-                raise ArchiveRootError(
+                raise ArchiveRootTransientError(
                     f"no authenticated root callback; launch output: {launch_output}; "
                     f"launcher log: {log}"
                 ) from error
-            try:
-                identity = await connection.ping()
-                evidence = {
-                    "model": model,
-                    "host": tv_host,
-                    "runtime": assessment.runtime,
-                    "runtime_source": assessment.runtime_source,
-                    "authenticated": True,
-                    "uid": identity.uid,
-                    "euid": identity.euid,
-                    "gid": identity.gid,
-                    "egid": identity.egid,
-                    "cap_eff": identity.effective_capabilities,
-                    "smack": identity.smack_label.strip(),
-                    "preflight_capabilities": assessment.capabilities,
-                }
-                if commands:
-                    evidence["commands"] = []
-                    for command_text in commands:
-                        result = await connection.execute(command_text, command_timeout)
-                        evidence["commands"].append(
-                            {
-                                "command": command_text,
-                                "exit_code": result.exit_code,
-                                "timed_out": result.timed_out,
-                                "stdout": result.stdout,
-                                "stderr": result.stderr,
-                            }
-                        )
-            finally:
-                await connection.shutdown()
+            identity = await connection.ping()
+            if any(
+                value != 0
+                for value in (identity.uid, identity.euid, identity.gid, identity.egid)
+            ):
+                raise ArchiveRootError(
+                    "archive root callback was not uid/gid 0: "
+                    f"uid={identity.uid} euid={identity.euid} "
+                    f"gid={identity.gid} egid={identity.egid}"
+                )
             if launch_task is not None:
                 launch_result = await asyncio.wait_for(launch_task, timeout=15)
                 if "[exit:0]" not in launch_result.output:
@@ -392,28 +434,83 @@ async def probe(
                         "launcher exited unsuccessfully: "
                         + launch_result.output.strip()
                     )
-            return evidence
-    finally:
+            return ArchiveRootLease(
+                connection=connection,
+                server=server,
+                client=client,
+                package=package,
+                assessment=assessment,
+                launch_task=launch_task,
+            )
+    except BaseException:
         await server.close()
         if launch_task is not None and not launch_task.done():
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.wait_for(launch_task, timeout=5)
-            except Exception:
-                pass
-        cleaned = False
         if staging_started:
-            try:
-                cleaned = await asyncio.to_thread(_cleanup, client, package)
-            except (ArchiveRootError, SdbError):
-                pass
-        final_hashes = await asyncio.to_thread(_capture, client, SYSTEM_HASH_COMMAND)
-        if "evidence" in locals():
-            evidence["system_files_unchanged"] = (
-                final_hashes == assessment.original_hashes
-            )
-            evidence["staging_cleaned"] = cleaned
-            if not evidence["system_files_unchanged"] or not cleaned:
-                raise ArchiveRootError(
-                    "root callback succeeded, but system-file or cleanup checks failed; "
-                    f"staging={STAGING_ROOT / package}"
+            with contextlib.suppress(ArchiveRootError, SdbError):
+                await asyncio.to_thread(_cleanup, client, package)
+        raise
+
+
+async def probe(
+    tv_host: str,
+    *,
+    model: str | None = None,
+    runtime: str | None = None,
+    callback_host: str | None = None,
+    bind_host: str | None = None,
+    sdb_timeout: float = 15.0,
+    accept_timeout: float = 30.0,
+    command_timeout: float = 45.0,
+    commands: tuple[str, ...] = (),
+    payloads: Path | None = None,
+) -> dict[str, object]:
+    lease = await acquire(
+        tv_host,
+        runtime=runtime,
+        callback_host=callback_host,
+        bind_host=bind_host,
+        sdb_timeout=sdb_timeout,
+        accept_timeout=accept_timeout,
+        payloads=payloads,
+    )
+    evidence: dict[str, object] = {
+        "model": model,
+        "host": tv_host,
+        "runtime": lease.assessment.runtime,
+        "runtime_source": lease.assessment.runtime_source,
+        "authenticated": True,
+        "uid": lease.connection.identity.uid,
+        "euid": lease.connection.identity.euid,
+        "gid": lease.connection.identity.gid,
+        "egid": lease.connection.identity.egid,
+        "cap_eff": lease.connection.identity.effective_capabilities,
+        "smack": lease.connection.identity.smack_label.strip(),
+        "preflight_capabilities": lease.assessment.capabilities,
+    }
+    try:
+        if commands:
+            evidence["commands"] = []
+            for command_text in commands:
+                result = await lease.connection.execute(command_text, command_timeout)
+                evidence["commands"].append(
+                    {
+                        "command": command_text,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.timed_out,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }
                 )
+        return evidence
+    finally:
+        await lease.shutdown()
+        await lease.close()
+        evidence["system_files_unchanged"] = lease.system_files_unchanged
+        evidence["staging_cleaned"] = lease.cleaned
+        if not evidence["system_files_unchanged"] or not evidence["staging_cleaned"]:
+            raise ArchiveRootError(
+                "root callback succeeded, but system-file or cleanup checks failed; "
+                f"staging={STAGING_ROOT / lease.package}"
+            )

@@ -10,10 +10,11 @@ from typing import Any
 
 
 CONFIGURATION_VERSION = 1
-MODEL_NAMES = frozenset({"qn90b", "qn90f"})
+MODEL_NAMES = frozenset({"qn90b", "qn90f", "archive"})
 REMOTE_ACTION_NAMES = frozenset(
     {
         "suppress",
+        "app.launch",
         "source.select",
         "source.recover",
         "hdmi_policy.enforce",
@@ -24,6 +25,7 @@ REMOTE_ACTION_NAMES = frozenset(
         "display.wake",
     }
 )
+APPLICATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
@@ -50,6 +52,7 @@ class RemoteRuleConfiguration:
     code: int | None = None
     device: str | None = None
     source: str | None = None
+    app: str | None = None
     event: str = "down"
 
 
@@ -76,6 +79,7 @@ class TelevisionConfiguration:
     disable_native_execution_policy: bool
     remote: RemoteConfiguration
     events: NativeEventsConfiguration = NativeEventsConfiguration()
+    post_root_commands: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -148,6 +152,18 @@ def configuration_template() -> str:
 # Uncomment when sdb is outside the standard Tizen Studio locations.
 # sdb = "C:/tizen-studio/tools/sdb.exe"
 
+# Supported model profiles: "qn90b", "qn90f", and "archive" for the
+# model-independent archive-launcher route (v0.0.9 or newer). Example:
+#
+# [televisions.my-tv]
+# model = "archive"
+# host = "192.0.2.50"
+# root_on_presence = true
+# disable_native_execution_policy = false
+# # Shell commands executed as uid 0 over the fresh root connection after
+# # every successful acquisition (volatile /run changes, for example):
+# post_root_commands = ["systemctl mask --runtime --now some-service.service"]
+
 [televisions.my-tv]
 model = "qn90f"
 host = "192.0.2.50"
@@ -179,6 +195,7 @@ def _parse_television(name: object, value: object) -> TelevisionConfiguration:
             "disable_native_execution_policy",
             "remote",
             "events",
+            "post_root_commands",
         },
         f"televisions.{name}",
     )
@@ -199,6 +216,15 @@ def _parse_television(name: object, value: object) -> TelevisionConfiguration:
     )
     if device_id is not None and not device_id.startswith("uuid:"):
         raise ConfigurationError(f"televisions.{name}.device_id must start with uuid:")
+    raw_post_root = table.get("post_root_commands", [])
+    if not isinstance(raw_post_root, list):
+        raise ConfigurationError(
+            f"televisions.{name}.post_root_commands must be an array"
+        )
+    post_root_commands = tuple(
+        _string(item, f"televisions.{name}.post_root_commands[{index}]")
+        for index, item in enumerate(raw_post_root)
+    )
     return TelevisionConfiguration(
         name=name,
         model=model,
@@ -214,6 +240,7 @@ def _parse_television(name: object, value: object) -> TelevisionConfiguration:
         ),
         remote=_parse_remote(name, table.get("remote")),
         events=_parse_native_events(name, table.get("events")),
+        post_root_commands=post_root_commands,
     )
 
 
@@ -323,7 +350,7 @@ def _parse_remote_rule(
     table = _table(value, path)
     _reject_unknown(
         table,
-        {"action", "key", "code", "device", "source", "event"},
+        {"action", "key", "code", "device", "source", "app", "event"},
         path,
     )
     action = _string(table.get("action"), f"{path}.action")
@@ -354,6 +381,16 @@ def _parse_remote_rule(
         "hdmi_policy.enforce",
     }:
         raise ConfigurationError(f"{path}.source is not valid for {action}")
+    app = _optional_string(table.get("app"), f"{path}.app")
+    if app is not None and APPLICATION_ID_PATTERN.fullmatch(app) is None:
+        raise ConfigurationError(
+            f"{path}.app must contain only letters, digits, dots, underscores, "
+            "and hyphens"
+        )
+    if action == "app.launch" and app is None:
+        raise ConfigurationError(f"{path}.app is required for app.launch")
+    if app is not None and action != "app.launch":
+        raise ConfigurationError(f"{path}.app is not valid for {action}")
     device = _optional_string(table.get("device"), f"{path}.device")
     return RemoteRuleConfiguration(
         action=action,
@@ -361,6 +398,7 @@ def _parse_remote_rule(
         code=code,
         device=device,
         source=source,
+        app=app,
         event=event,
     )
 

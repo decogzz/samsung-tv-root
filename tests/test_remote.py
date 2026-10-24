@@ -40,6 +40,14 @@ def test_remote_filter_blocks_only_explicit_rule_tokens() -> None:
     )
 
 
+def test_app_launch_action_maps_to_capability_request() -> None:
+    action, request = _capability_request(
+        RemoteRuleConfiguration(action="app.launch", key="XF86Home", app="FreeMyTV.tizen")
+    )
+    assert action == "app.launch"
+    assert request == {"app": "FreeMyTV.tizen"}
+
+
 def test_remote_local_dimming_action_maps_to_packaged_capability() -> None:
     action, request = _capability_request(
         RemoteRuleConfiguration(action="local_dimming.enable", key="XF86Guide")

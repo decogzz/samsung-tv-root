@@ -6,7 +6,7 @@ from samsung_tv_root.config import (
     RetryConfiguration,
     TelevisionConfiguration,
 )
-from samsung_tv_root.lifecycle import RootLifecycle
+from samsung_tv_root.lifecycle import ArchiveRootBackend, RootLifecycle, root_backend
 
 
 class FakeConnection:
@@ -14,6 +14,11 @@ class FakeConnection:
         self.identity = SimpleNamespace(pid=42)
         self.closed = False
         self.closed_event = asyncio.Event()
+        self.commands: list[str] = []
+
+    async def execute(self, command: str, timeout: float):
+        self.commands.append(command)
+        return SimpleNamespace(exit_code=0, timed_out=False, stdout="", stderr="")
 
     async def wait_closed(self) -> None:
         await self.closed_event.wait()
@@ -72,15 +77,20 @@ class GenerationBackend:
         return isinstance(error, ConnectionError)
 
 
-def configuration() -> TelevisionConfiguration:
+def configuration(
+    *,
+    model: str = "qn90f",
+    post_root_commands: tuple[str, ...] = (),
+) -> TelevisionConfiguration:
     return TelevisionConfiguration(
         name="living-room",
-        model="qn90f",
+        model=model,
         host="192.0.2.5",
         device_id=None,
         root_on_presence=True,
         disable_native_execution_policy=False,
         remote=RemoteConfiguration(),
+        post_root_commands=post_root_commands,
     )
 
 
@@ -108,6 +118,32 @@ def test_presence_event_acquires_root_without_polling() -> None:
         await wait_for_state(lifecycle, "rooted")
         assert lifecycle.lease is lease
         assert backend.calls == 1
+        await lifecycle.close()
+
+    asyncio.run(exercise())
+
+
+def test_root_backend_dispatches_archive_model() -> None:
+    backend = root_backend(configuration(model="archive"))
+    assert isinstance(backend, ArchiveRootBackend)
+
+
+def test_post_root_commands_run_after_acquire() -> None:
+    async def exercise() -> None:
+        lease = FakeLease()
+        backend = FakeBackend([lease])
+        lifecycle = RootLifecycle(
+            configuration(
+                post_root_commands=("systemctl mask --runtime --now adagent-service.service",)
+            ),
+            RetryConfiguration((0.01,)),
+            backend,
+        )
+        await lifecycle.observe_presence("192.0.2.5", "boot-1", True)
+        await wait_for_state(lifecycle, "rooted")
+        assert lease.connection.commands == [
+            "systemctl mask --runtime --now adagent-service.service"
+        ]
         await lifecycle.close()
 
     asyncio.run(exercise())

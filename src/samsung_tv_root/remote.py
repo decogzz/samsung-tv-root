@@ -36,6 +36,7 @@ REMOTE_AGENT_NAME = "SamsungTvRemoteInputAgent.dll"
 REMOTE_DIRECTORIES = {
     "qn90b": PurePosixPath("/home/owner/share/tmp/sdk_tools/samsung-tv-root/qn90b"),
     "qn90f": PurePosixPath("/home/owner/share/tmp/sdk_tools/qn90f-probe"),
+    "archive": PurePosixPath("/home/owner/share/tmp/sdk_tools/samsung-tv-root/archive"),
 }
 
 
@@ -662,6 +663,8 @@ def _matches(rule: RemoteRuleConfiguration, event: dict[str, Any]) -> bool:
 def _capability_request(
     rule: RemoteRuleConfiguration,
 ) -> tuple[str, dict[str, Any]]:
+    if rule.action == "app.launch":
+        return rule.action, {"app": rule.app}
     if rule.action == "source.select":
         return rule.action, {"source": rule.source}
     if rule.action == "hdmi_policy.enforce" and rule.source is not None:

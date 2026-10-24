@@ -6,6 +6,11 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .archive_root import (
+    ArchiveRootLease,
+    ArchiveRootTransientError,
+    acquire as acquire_archive_root,
+)
 from .compatibility import QN90F_PROFILE, TargetCompatibilityError
 from .config import RetryConfiguration, TelevisionConfiguration
 from .qn90b import (
@@ -176,11 +181,43 @@ class Qn90fRootBackend:
         return f"/usr/bin/dotnet {REMOTE_PROBE_PATH} disable-uep"
 
 
+class ArchiveRootBackend:
+    def __init__(self, configuration: TelevisionConfiguration) -> None:
+        self.configuration = configuration
+
+    async def acquire(self, host: str) -> ArchiveRootLease:
+        if self.configuration.disable_native_execution_policy:
+            raise RootLifecycleError(
+                "the archive route does not implement UEP disable"
+            )
+        callback_host = route_callback_host(host)
+        return await acquire_archive_root(
+            host,
+            callback_host=callback_host,
+            bind_host=callback_host,
+        )
+
+    def is_transient(self, error: BaseException) -> bool:
+        return isinstance(
+            error,
+            (
+                ArchiveRootTransientError,
+                SdbError,
+                RootAgentUnavailableError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+            ),
+        )
+
+
 def root_backend(configuration: TelevisionConfiguration) -> RootBackend:
     if configuration.model == "qn90b":
         return Qn90bRootBackend(configuration)
     if configuration.model == "qn90f":
         return Qn90fRootBackend(configuration)
+    if configuration.model == "archive":
+        return ArchiveRootBackend(configuration)
     raise RootLifecycleError(f"unsupported model: {configuration.model}")
 
 
@@ -355,22 +392,30 @@ class RootLifecycle:
             if self._closed or generation != self.generation or host != self.host:
                 await lease.close()
             else:
-                self.lease = lease
-                self.state = "rooted"
-                self.error = None
-                self._retry_index = 0
-                self._cancel_retry()
-                self._lease_monitor = asyncio.create_task(
-                    self._monitor_lease(lease, generation)
-                )
-                self._logger.info(
-                    "root acquired television=%s model=%s host=%s pid=%s",
-                    self.configuration.name,
-                    self.configuration.model,
-                    host,
-                    lease.connection.identity.pid,
-                )
-                self._changed()
+                try:
+                    await self._run_post_root_commands(lease)
+                except Exception as error:
+                    await lease.close()
+                    self.error = f"{type(error).__name__}: {error}"
+                    self._schedule_retry(generation)
+                    self._changed()
+                else:
+                    self.lease = lease
+                    self.state = "rooted"
+                    self.error = None
+                    self._retry_index = 0
+                    self._cancel_retry()
+                    self._lease_monitor = asyncio.create_task(
+                        self._monitor_lease(lease, generation)
+                    )
+                    self._logger.info(
+                        "root acquired television=%s model=%s host=%s pid=%s",
+                        self.configuration.name,
+                        self.configuration.model,
+                        host,
+                        lease.connection.identity.pid,
+                    )
+                    self._changed()
         finally:
             self._acquisition = None
 
@@ -430,6 +475,18 @@ class RootLifecycle:
                     self._retry_index = 0
                     self._schedule_retry(generation)
                 self._changed()
+
+    async def _run_post_root_commands(self, lease: RootLease) -> None:
+        for command in self.configuration.post_root_commands:
+            result = await lease.connection.execute(command, 150.0)
+            if result.timed_out or result.exit_code != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                raise RootLifecycleError(
+                    f"post_root_command failed ({command!r} exit={result.exit_code}"
+                    f"{' timed_out' if result.timed_out else ''}"
+                    + (f": {detail}" if detail else "")
+                    + ")"
+                )
 
     async def _replace_lease(self) -> None:
         lease = self.lease
